@@ -1,0 +1,204 @@
+#include "Arduino.h"
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
+#include "esp_task_wdt.h"
+#include <Wire.h>
+//#define MY_DEBUG_MESSAGES
+
+#define LCD_RETRO_LED_PIN 7
+#define FAN_LED_PIN 5
+
+#define ADC_1_3 35
+#define ADC_RESOLUTION 12
+#define VREF_PLUS  3.3
+#define VREF_MINUS  0.0
+#define MY_ANALOG_INPUT 0
+#define MY_I2C_INPUT 1
+
+void vTaskReadTemp(void *pvParameters);
+void vTaskControlPWM(void *pvParameters);
+void vTaskBrain(void *pvParameters);
+
+const char *pcTextForTaskTemp = "vTaskReadTemp \r\n";
+const char *pcTextForTaskFan = "vTaskControlFan\t\n";
+
+QueueHandle_t xQueueSendTemperature;
+
+typedef struct {
+	unsigned char ucValue;
+	unsigned char ucSource;
+} xData;
+
+/*-----------------------------------------------------------*/
+void setup(void) {
+	vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
+	Serial.begin(115200);
+
+	xQueueSendTemperature = xQueueCreate(3, sizeof(xData));
+
+	xTaskCreatePinnedToCore(vTaskReadTemp, "Temp Analog", 1024,
+			(void*) MY_ANALOG_INPUT, 2, NULL, 1);
+	xTaskCreatePinnedToCore(vTaskReadTemp, "Temp I2C", 1024,
+			(void*) MY_I2C_INPUT, 2, NULL, 1);
+	xTaskCreatePinnedToCore(vTaskControlPWM, "FAN control", 1024,
+			(void*) FAN_LED_PIN, 1, NULL, 1);
+	xTaskCreatePinnedToCore(vTaskBrain, "Brain", 1024, (void*) FAN_LED_PIN, 4,
+	NULL, 1);
+}
+/*-----------------------------------------------------------*/
+
+void vTaskReadTemp(void *pvParameters) {
+	char *pcTaskName;
+	TickType_t xLastWakeTime;
+	int iIndexToSensor;
+	int analog_value = 0;
+	float analog_voltage = 0;
+	float my_temperature = 0;
+	int TCN75A_Address = 0b01001000;
+	int reading = 0;
+	xData xSendTemperature;
+	portBASE_TYPE xStatus;
+
+	pcTaskName = (char*) pvParameters;
+	xLastWakeTime = xTaskGetTickCount();
+	iIndexToSensor = (int) pvParameters;
+
+	if (iIndexToSensor == MY_ANALOG_INPUT) {
+		analogReadResolution(ADC_RESOLUTION);
+		xSendTemperature.ucSource = MY_ANALOG_INPUT;
+		Serial.println("ESP32 Analog Input ==> ADC_1_0 (GPIO36)");
+	} else if (iIndexToSensor == MY_I2C_INPUT) {
+		Wire.begin();
+		Wire.beginTransmission(TCN75A_Address);
+		Wire.write(0b00000001);
+		Wire.write(0b01100000);
+		Wire.endTransmission();
+		Wire.beginTransmission(TCN75A_Address);
+		Wire.write(0b00000000);
+		Wire.endTransmission();
+		xSendTemperature.ucSource = MY_I2C_INPUT;
+		Serial.println("ESP32 I2C Input ==> TCN75A");
+	} else {
+		Serial.println("INCORRECT TYPE OF SENSOR SELECTED)");
+	}
+
+	for (;;) {
+		if (iIndexToSensor == MY_ANALOG_INPUT) {
+			analog_value = analogRead(ADC_1_3);
+			analog_voltage = analog_value * (VREF_PLUS - VREF_MINUS)
+					/ (pow(2.0, (float) ADC_RESOLUTION)) + VREF_MINUS;
+			my_temperature = analog_voltage * 10.0;
+#ifdef MY_DEBUG_MESSAGES
+			Serial.print("ADC_1_3: ");
+			Serial.println(analog_value);
+			Serial.print("ADC_1_3 TEMP: ");
+			Serial.println(my_temperature);
+#endif
+			xSendTemperature.ucValue = my_temperature;
+			xStatus = xQueueSendToBack(xQueueSendTemperature, &xSendTemperature,
+					0);
+			if (xStatus != pdPASS) {
+				Serial.print("Could not send to the queue ADC_1_3 TEMP.\r\n");
+			}
+
+		} else if (iIndexToSensor == MY_I2C_INPUT) {
+			Wire.requestFrom(TCN75A_Address, 2);
+			if (Wire.available() >= 2) {
+				reading = Wire.read();
+				reading = reading << 8;
+				reading |= Wire.read();
+				reading = reading >> 4;
+			}
+			my_temperature = (float) reading / 16;
+#ifdef MY_DEBUG_MESSAGES
+			Serial.print("I2C TCN75A TEMP: ");
+			Serial.println(my_temperature);
+#endif
+			xSendTemperature.ucValue = my_temperature;
+			xStatus = xQueueSendToBack(xQueueSendTemperature, &xSendTemperature,
+					0);
+			if (xStatus != pdPASS) {
+				Serial.print("Could not send to the queue ADC_1_3 TEMP.\r\n");
+			}
+
+		} else {
+			Serial.println("INCORRECT TYPE OF SENSOR SELECTED)");
+		}
+		vTaskDelayUntil(&xLastWakeTime, (250 / portTICK_PERIOD_MS));
+	}
+}
+/*-----------------------------------------------------------*/
+void vTaskControlPWM(void *pvParameters) {
+	char *pcTaskName;
+	int freq = 5000;
+	int ledChannel = 0;
+	int resolution = 8;
+	int dutyCycle = 0;
+	int iIndexToPWMpin = 0;
+
+	TickType_t xLastWakeTime;
+	pcTaskName = (char*) pvParameters;
+	xLastWakeTime = xTaskGetTickCount();
+	iIndexToPWMpin = (int) pvParameters;
+
+	if (iIndexToPWMpin < 16) {
+		ledChannel = iIndexToPWMpin;
+		Serial.print("CHANNEL NUMBER: ");
+		Serial.println(ledChannel);
+	} else {
+		Serial.println("INCORRECT CHANNEL NUMBER SELECTED)");
+	}
+
+	ledcSetup(ledChannel, freq, resolution);
+	ledcAttachPin(iIndexToPWMpin, ledChannel);
+
+	for (;;) {
+		if (iIndexToPWMpin < 16) {
+			if (dutyCycle >= pow(2, resolution))
+				dutyCycle = 0;
+			dutyCycle++;
+			ledcWrite(ledChannel, dutyCycle);
+			Serial.print("PWM FAN: ");
+			Serial.println(dutyCycle);
+		} else {
+			Serial.println("INCORRECT CHANNEL NUMBER SELECTED)");
+		}
+		vTaskDelayUntil(&xLastWakeTime, (250 / portTICK_PERIOD_MS));
+
+	}
+}
+/*-----------------------------------------------------------*/
+static void vTaskBrain(void *pvParameters) {
+	char *pcTaskName;
+	xData xReceivedStructure;
+	portBASE_TYPE xStatus;
+	TickType_t xLastWakeTime;
+	xLastWakeTime = xTaskGetTickCount();
+
+	for (;;) {
+
+		xStatus = xQueueReceive(xQueueSendTemperature, &xReceivedStructure, 0);
+
+		if (xStatus == pdPASS) {
+			if (xReceivedStructure.ucSource == MY_ANALOG_INPUT) {
+				Serial.print("ADC_1_3 TEMP: ");
+				Serial.println(xReceivedStructure.ucValue);
+			} else if (xReceivedStructure.ucSource == MY_I2C_INPUT) {
+				Serial.print("I2C TCN75A TEMP: ");
+				Serial.println(xReceivedStructure.ucValue);
+			} else {
+				Serial.println("UNKNOWN SENSOR");
+			}
+		} else {
+			Serial.print("Could not receive from the queue.\r\n");
+		}
+		vTaskDelayUntil(&xLastWakeTime, (100 / portTICK_PERIOD_MS));
+	}
+}
+//------------------------------------------------------------------------------
+void loop() {
+	vTaskDelete( NULL);
+}
